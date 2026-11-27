@@ -52,7 +52,7 @@ def fetch_page(url):
         print(f"curl exit {result.returncode} after {elapsed:.1f}s: {message}", file=sys.stderr, flush=True)
         if result.returncode == 28:
             # Split feature requests immediately on timeouts; metadata can retry.
-            if "objectIds=" in url:
+            if "resultOffset=" in url:
                 raise DownloadTimeout(message)
             if attempt == 2:
                 raise DownloadTimeout(message)
@@ -69,78 +69,81 @@ def query(layer, fetch, **params):
     return result
 
 
-def object_ids(layer, fetch):
-    result = query(layer, fetch, where="1=1", returnIdsOnly="true", f="json")
-    if result.get("exceededTransferLimit") or "objectIds" not in result:
-        raise ValueError(f"Invalid object ID response for layer {layer}: {result!r}")
-    ids = result["objectIds"]
-    if ids is None:
-        # ArcGIS can return null rather than [] when the layer is empty.
-        # Confirm the count so an incomplete response is never published.
-        count = query(layer, fetch, where="1=1", returnCountOnly="true", f="json")
-        if type(count.get("count")) is not int or count["count"] != 0:
-            raise ValueError(f"Null object IDs for layer {layer}, but count response was {count!r}")
-        print(f"Layer {layer}: empty (null object IDs, count confirmed zero)", flush=True)
-        return []
-    if not isinstance(ids, list) or any(type(oid) is not int for oid in ids):
-        raise ValueError(f"Invalid object ID list for layer {layer}: {result!r}")
-    return sorted(set(ids))
+def layer_count(layer, fetch):
+    result = query(layer, fetch, where="1=1", returnCountOnly="true", f="json")
+    count = result.get("count")
+    if type(count) is not int or count < 0:
+        raise ValueError(f"Invalid count for layer {layer}: {result!r}")
+    return count
 
 
-def fetch_batch(layer, ids, fetch):
-    try:
-        result = query(layer, fetch, where="1=1", objectIds=",".join(map(str, ids)),
-                       outFields="*", returnGeometry="true", outSR=4326,
-                       returnZ="false", returnM="false", f="geojson")
-    except DownloadTimeout:
-        if len(ids) <= 1:
-            raise
-        print(f"Layer {layer}: {len(ids)} features timed out; splitting batch", flush=True)
-        middle = len(ids) // 2
-        return fetch_batch(layer, ids[:middle], fetch) + fetch_batch(layer, ids[middle:], fetch)
-    if result.get("exceededTransferLimit"):
-        if len(ids) <= 1:
-            raise ValueError(f"Transfer limit exceeded for a single feature in layer {layer}")
-        middle = len(ids) // 2
-        return fetch_batch(layer, ids[:middle], fetch) + fetch_batch(layer, ids[middle:], fetch)
-    if result.get("type") != "FeatureCollection" or not isinstance(result.get("features"), list):
-        raise ValueError(f"Expected GeoJSON FeatureCollection for layer {layer}")
-
+def collect_layer(layer, fetch, batch_size):
+    expected = layer_count(layer, fetch)
+    print(f"Layer {layer} ({LAYERS[layer]}): expected {expected} features", flush=True)
     found = {}
-    for feature in result["features"]:
-        properties = feature.get("properties")
-        if (feature.get("type") != "Feature" or "geometry" not in feature
-                or not isinstance(properties, dict)):
-            raise ValueError(f"Invalid GeoJSON feature in layer {layer}")
-        oid = properties.get("objectid", feature.get("id"))
-        if type(oid) is not int or oid in found:
-            raise ValueError(f"Invalid or duplicate object ID in layer {layer}: {oid}")
-        # Object IDs are local to a layer; CAP IDs can span multiple geometries.
-        feature["id"] = f"{layer}:{oid}"
-        properties["noaa_layer"] = layer
-        properties["noaa_layer_name"] = LAYERS[layer]
-        found[oid] = feature
-    if set(found) != set(ids):
-        raise ValueError(f"Layer {layer} changed or returned incomplete results")
-    return [found[oid] for oid in ids]
+    offset = 0
+    page_size = batch_size
+    for _ in range(10000):
+        print(f"Layer {layer}: offset {offset}, page size {page_size}, collected {len(found)}/{expected}", flush=True)
+        try:
+            result = query(layer, fetch, where="1=1", outFields="*",
+                           returnGeometry="true", outSR=4326, returnZ="false",
+                           returnM="false", orderByFields="objectid ASC",
+                           resultOffset=offset, resultRecordCount=page_size, f="geojson")
+        except DownloadTimeout:
+            if page_size == 1:
+                raise
+            page_size = max(1, page_size // 2)
+            continue
+        if result.get("type") != "FeatureCollection" or not isinstance(result.get("features"), list):
+            raise ValueError(f"Invalid GeoJSON page for layer {layer}: {str(result)[:500]}")
+        page = result["features"]
+        if len(page) > page_size:
+            raise ValueError(f"Layer {layer} ignored requested page size")
+        for feature in page:
+            properties = feature.get("properties")
+            if (feature.get("type") != "Feature" or "geometry" not in feature
+                    or not isinstance(properties, dict)):
+                raise ValueError(f"Invalid GeoJSON feature in layer {layer}")
+            oid = properties.get("objectid", feature.get("id"))
+            if type(oid) is not int or oid in found or (found and oid <= next(reversed(found))):
+                raise ValueError(f"Invalid, repeated or unordered object ID in layer {layer}: {oid}")
+            feature["id"] = f"{layer}:{oid}"
+            properties["noaa_layer"] = layer
+            properties["noaa_layer_name"] = LAYERS[layer]
+            found[oid] = feature
+        more = result.get("exceededTransferLimit", (result.get("properties") or {}).get("exceededTransferLimit"))
+        # Some GeoJSON responses omit the transfer flag. Use the independent
+        # count to continue full pages in that case, but never accept a short
+        # final result as complete.
+        if more is not True and not (more is None and len(page) == page_size and len(found) < expected):
+            break
+        # ArcGIS can return short or empty pages with more=true.
+        offset += page_size
+    else:
+        raise ValueError(f"Pagination limit reached for layer {layer}")
+    final_count = layer_count(layer, fetch)
+    if len(found) != expected or final_count != expected:
+        raise ValueError(f"Layer {layer} incomplete or changed: expected {expected}, "
+                         f"received {len(found)}, final count {final_count}, last offset {offset}")
+    return list(found.values())
 
 
 def collect_alerts(fetch=fetch_page, batch_size=BATCH_SIZE):
-    if batch_size < 1:
-        raise ValueError("Batch size must be positive")
+    if not 1 <= batch_size <= 4000:
+        raise ValueError("Batch size must be between 1 and 4000")
     features = []
     for layer in LAYERS:
-        print(f"Layer {layer} ({LAYERS[layer]}): requesting object IDs", flush=True)
-        ids = object_ids(layer, fetch)
-        print(f"Layer {layer}: {len(ids)} object IDs", flush=True)
-        for start in range(0, len(ids), batch_size):
-            end = min(start + batch_size, len(ids))
-            print(f"Layer {layer}: fetching {start + 1}-{end} of {len(ids)}", flush=True)
-            features.extend(fetch_batch(layer, ids[start:end], fetch))
-        print(f"Layer {layer}: checking completeness", flush=True)
-        if object_ids(layer, fetch) != ids:
-            raise ValueError(f"Layer {layer} changed during download; retry on next run")
-        print(f"Layer {layer} ({LAYERS[layer]}): {len(ids)} features", flush=True)
+        for attempt in range(2):
+            try:
+                layer_features = collect_layer(layer, fetch, batch_size)
+                break
+            except (ValueError, RuntimeError) as error:
+                if attempt == 1:
+                    raise
+                print(f"Layer {layer}: {error}; restarting layer once", flush=True)
+        features.extend(layer_features)
+        print(f"Layer {layer} ({LAYERS[layer]}): {len(layer_features)} features", flush=True)
     return {"type": "FeatureCollection", "features": features}
 
 
@@ -170,7 +173,7 @@ def archive_features(collection, name):
 def fetch_archive():
     if not shutil.which("ogr2ogr"):
         raise RuntimeError("NOAA archive fallback requires ogr2ogr (sudo apt install gdal-bin)")
-    print(f"MapServer returned no records; downloading {ARCHIVE_URL}", flush=True)
+    print(f"Downloading NOAA archive fallback: {ARCHIVE_URL}", flush=True)
     with tempfile.TemporaryDirectory(prefix="noaa-wwa-") as directory:
         root = Path(directory)
         archive = root / "current_all.tar.gz"
@@ -211,7 +214,11 @@ def fetch_archive():
 
 
 def collect_with_fallback(primary=collect_alerts, fallback=fetch_archive):
-    collection = primary()
+    try:
+        collection = primary()
+    except (ValueError, RuntimeError, OSError) as error:
+        print(f"MapServer failed: {error}; using archive fallback", file=sys.stderr, flush=True)
+        collection = {"type": "FeatureCollection", "features": []}
     if not collection["features"]:
         collection = fallback()
     if not collection["features"]:
