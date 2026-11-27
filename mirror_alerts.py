@@ -3,41 +3,57 @@
 import json
 import os
 import sys
+import subprocess
 import time
 from pathlib import Path
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 BASE_URL = "https://mapservices.weather.noaa.gov/eventdriven/rest/services/WWA/watch_warn_adv/MapServer"
-LAYERS = {1: "WatchesWarnings", 0: "CurrentWarnings"}
-BATCH_SIZE = 200
-HEADERS = {
-    "Accept": "application/json, application/geo+json",
-    "User-Agent": "CatenaryTransit/weather-alerts-mirror (https://github.com/catenarytransit/weather-alerts-mirror)",
-}
+LAYERS = {0: "CurrentWarnings", 1: "WatchesWarnings"}
+BATCH_SIZE = 100
+USER_AGENT = "CatenaryTransit/weather-alerts-mirror (https://github.com/catenarytransit/weather-alerts-mirror)"
+
+
+class DownloadTimeout(RuntimeError):
+    pass
 
 
 def fetch_page(url):
-    for attempt in range(5):
+    # curl bounds the entire transfer, including connection and response body,
+    # unlike urllib's socket inactivity timeout.
+    for attempt in range(1, 3):
+        started = time.monotonic()
+        print(f"GET {url} (attempt {attempt}/2, deadline 30s)", flush=True)
         try:
-            with urlopen(Request(url, headers=HEADERS), timeout=45) as response:
-                result = json.load(response)
-                if not isinstance(result, dict) or "error" in result:
-                    raise ValueError(f"ArcGIS query failed: {result}")
-                return result
-        except (HTTPError, URLError, TimeoutError) as error:
-            if isinstance(error, HTTPError) and error.code not in (408, 429, 500, 502, 503, 504):
-                raise
-            if attempt == 4:
-                raise
-            delay = 2 ** attempt
-            if isinstance(error, HTTPError):
-                retry_after = error.headers.get("Retry-After", "")
-                if retry_after.isdigit():
-                    delay = max(delay, int(retry_after))
-            print(f"Request failed: {error}; retrying in {delay}s", file=sys.stderr, flush=True)
-            time.sleep(delay)
+            result = subprocess.run(
+                ["curl", "--fail", "--silent", "--show-error", "--compressed",
+                 "--connect-timeout", "8", "--max-time", "30",
+                 "--user-agent", USER_AGENT, url],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=35,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise DownloadTimeout(f"Request exceeded 35s: {url}") from error
+
+        elapsed = time.monotonic() - started
+        if result.returncode == 0:
+            print(f"Received {len(result.stdout):,} bytes in {elapsed:.1f}s", flush=True)
+            data = json.loads(result.stdout)
+            if not isinstance(data, dict) or "error" in data:
+                raise ValueError(f"ArcGIS query failed: {data}")
+            return data
+
+        message = result.stderr.decode("utf-8", errors="replace").strip()
+        print(f"curl exit {result.returncode} after {elapsed:.1f}s: {message}", file=sys.stderr, flush=True)
+        if result.returncode == 28:
+            # Split feature requests immediately on timeouts; metadata can retry.
+            if "objectIds=" in url:
+                raise DownloadTimeout(message)
+            if attempt == 2:
+                raise DownloadTimeout(message)
+        elif result.returncode not in (5, 6, 7, 18, 22, 35, 52, 55, 56) or attempt == 2:
+            raise RuntimeError(f"Download failed: {message}")
+        print("Retrying in 2s", flush=True)
+        time.sleep(2)
 
 
 def query(layer, fetch, **params):
@@ -57,9 +73,16 @@ def object_ids(layer, fetch):
 
 
 def fetch_batch(layer, ids, fetch):
-    result = query(layer, fetch, objectIds=",".join(map(str, ids)),
-                   outFields="*", returnGeometry="true", outSR=4326,
-                   returnZ="false", returnM="false", f="geojson")
+    try:
+        result = query(layer, fetch, where="1=1", objectIds=",".join(map(str, ids)),
+                       outFields="*", returnGeometry="true", outSR=4326,
+                       returnZ="false", returnM="false", f="geojson")
+    except DownloadTimeout:
+        if len(ids) <= 1:
+            raise
+        print(f"Layer {layer}: {len(ids)} features timed out; splitting batch", flush=True)
+        middle = len(ids) // 2
+        return fetch_batch(layer, ids[:middle], fetch) + fetch_batch(layer, ids[middle:], fetch)
     if result.get("exceededTransferLimit"):
         if len(ids) <= 1:
             raise ValueError(f"Transfer limit exceeded for a single feature in layer {layer}")
@@ -92,9 +115,14 @@ def collect_alerts(fetch=fetch_page, batch_size=BATCH_SIZE):
         raise ValueError("Batch size must be positive")
     features = []
     for layer in LAYERS:
+        print(f"Layer {layer} ({LAYERS[layer]}): requesting object IDs", flush=True)
         ids = object_ids(layer, fetch)
+        print(f"Layer {layer}: {len(ids)} object IDs", flush=True)
         for start in range(0, len(ids), batch_size):
-            features.extend(fetch_batch(layer, ids[start:start + batch_size], fetch))
+            end = min(start + batch_size, len(ids))
+            print(f"Layer {layer}: fetching {start + 1}-{end} of {len(ids)}", flush=True)
+            features.extend(fetch_batch(layer, ids[start:end], fetch))
+        print(f"Layer {layer}: checking completeness", flush=True)
         if object_ids(layer, fetch) != ids:
             raise ValueError(f"Layer {layer} changed during download; retry on next run")
         print(f"Layer {layer} ({LAYERS[layer]}): {len(ids)} features", flush=True)
