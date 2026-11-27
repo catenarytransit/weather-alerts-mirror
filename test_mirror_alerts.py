@@ -1,6 +1,8 @@
 import unittest
 from urllib.parse import urlsplit, parse_qs
-from mirror_alerts import collect_alerts, LAYERS
+from mirror_alerts import (collect_alerts, LAYERS, DownloadTimeout,
+                           on_screen_alerts, minor_alert_ids, MINOR_URL,
+                           collect_with_fallback, archive_features)
 
 
 def mock_server(url):
@@ -32,6 +34,14 @@ class MapServerTests(unittest.TestCase):
             return mock_server(url)
         self.assertEqual(len(collect_alerts(fetch)["features"]), 4)
 
+    def test_timeout_splits_batch(self):
+        def fetch(url):
+            params = parse_qs(urlsplit(url).query)
+            if "," in params.get("objectIds", [""])[0]:
+                raise DownloadTimeout("mock timeout")
+            return mock_server(url)
+        self.assertEqual(len(collect_alerts(fetch)["features"]), 4)
+
     def test_missing_feature_fails(self):
         def fetch(url):
             result = mock_server(url)
@@ -45,8 +55,90 @@ class MapServerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             collect_alerts(lambda _: {"error": {"code": 500}})
 
+    def test_null_object_ids_with_zero_count(self):
+        def fetch(url):
+            params = parse_qs(urlsplit(url).query)
+            if params.get("returnCountOnly") == ["true"]:
+                return {"count": 0}
+            return {"objectIdFieldName": "objectid", "objectIds": None}
+        self.assertEqual(collect_alerts(fetch)["features"], [])
+
+    def test_null_object_ids_with_positive_count_fails(self):
+        def fetch(url):
+            if "returnCountOnly=true" in url:
+                return {"count": 5}
+            return {"objectIds": None}
+        with self.assertRaises(ValueError):
+            collect_alerts(fetch)
+
     def test_empty_layers(self):
         self.assertEqual(collect_alerts(lambda _: {"objectIds": []})["features"], [])
+
+
+class DisplayTests(unittest.TestCase):
+    def test_filter_preserves_full_snapshot(self):
+        properties = [
+            {"prod_type": "Small Craft Advisory"},
+            {"prod_type": "GALE WARNING"},
+            {"prod_type": "Heavy Freezing Spray Warning"},
+            {"prod_type": "Flood Advisory", "severity": " Minor "},
+            {"prod_type": "Flood Advisory", "cap_id": "urn:oid:minor"},
+            {"prod_type": "Tornado Warning", "severity": "Severe"},
+            {"prod_type": "Wind Advisory"},
+            {"prod_type": "Gale Watch"},
+        ]
+        collection = {"type": "FeatureCollection", "features": [
+            {"type": "Feature", "id": i, "geometry": None, "properties": p}
+            for i, p in enumerate(properties)]}
+        display = on_screen_alerts(collection, {"urn:oid:minor"})
+        self.assertEqual([f["id"] for f in display["features"]], [5, 6, 7])
+        self.assertEqual(len(collection["features"]), 8)
+        self.assertIs(display["features"][0], collection["features"][5])
+
+    def test_minor_index_follows_cursor_and_normalizes_ids(self):
+        second = "https://api.weather.gov/alerts?cursor=abc"
+        pages = {
+            MINOR_URL: {"type": "FeatureCollection", "features": [
+                {"id": "https://api.weather.gov/alerts/urn%3Aoid%3Afirst",
+                 "properties": {"severity": "Minor", "id": "urn:oid:first"}}
+            ], "pagination": {"next": second}},
+            second: {"type": "FeatureCollection", "features": [
+                {"properties": {"severity": "Minor", "id": "urn:oid:second"}}
+            ]}
+        }
+        self.assertEqual(minor_alert_ids(pages.__getitem__, lambda _: None),
+                         {"urn:oid:first", "urn:oid:second"})
+
+    def test_invalid_minor_index_fails(self):
+        with self.assertRaises(ValueError):
+            minor_alert_ids(lambda _: {"type": "FeatureCollection", "features": [
+                {"properties": {"severity": "Severe", "id": "urn:oid:wrong"}}
+            ]}, lambda _: None)
+
+
+class ArchiveTests(unittest.TestCase):
+    def test_empty_primary_uses_fallback(self):
+        empty = {"type": "FeatureCollection", "features": []}
+        full = {"type": "FeatureCollection", "features": [{"id": 1}]}
+        self.assertEqual(collect_with_fallback(lambda: empty, lambda: full), full)
+
+    def test_nonempty_primary_skips_fallback(self):
+        full = {"type": "FeatureCollection", "features": [{"id": 1}]}
+        def fail():
+            raise AssertionError("fallback should not run")
+        self.assertEqual(collect_with_fallback(lambda: full, fail), full)
+
+    def test_both_empty_fail(self):
+        empty = {"type": "FeatureCollection", "features": []}
+        with self.assertRaises(ValueError):
+            collect_with_fallback(lambda: empty, lambda: empty)
+
+    def test_archive_fields_normalized(self):
+        feature = {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": []},
+                   "properties": {"PROD_TYPE": "Gale Warning", "CAP_ID": "urn:oid:1"}}
+        result = archive_features({"type": "FeatureCollection", "features": [feature]}, "current_all")
+        self.assertEqual(result[0]["properties"]["prod_type"], "Gale Warning")
+        self.assertEqual(result[0]["properties"]["cap_id"], "urn:oid:1")
 
 
 if __name__ == "__main__":

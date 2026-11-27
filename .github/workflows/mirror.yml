@@ -21,6 +21,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test pagination
         run: python3 -m unittest -v
+      - name: Install GDAL for NOAA archive fallback
+        if: github.event_name != 'pull_request'
+        run: sudo apt-get update && sudo apt-get install -y gdal-bin
       - name: Fetch all active alerts
         if: github.event_name != 'pull_request'
         run: python3 mirror_alerts.py alerts.geojson
@@ -31,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! gh release view latest >/dev/null 2>&1; then
-            gh release create latest alerts.geojson --target "$GITHUB_SHA" --title "Latest weather alerts" --notes "Active NOAA/NWS weather alerts, refreshed every five minutes." --latest
+            gh release create latest alerts.geojson alerts-on-screen.geojson --target "$GITHUB_SHA" --title "Latest weather alerts" --notes "Active NOAA/NWS weather alerts, refreshed every five minutes." --latest
           else
-            gh release upload latest alerts.geojson --clobber
+            gh release upload latest alerts.geojson alerts-on-screen.geojson --clobber
           fi
