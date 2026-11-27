@@ -16,7 +16,17 @@ LAYERS = {0: "CurrentWarnings", 1: "WatchesWarnings"}
 BATCH_SIZE = 100
 ARCHIVE_URL = "https://tgftp.nws.noaa.gov/SL.us008001/DF.sha/DC.cap/DS.WWA/current_all.tar.gz"
 MINOR_URL = "https://api.weather.gov/alerts?active=true&severity=Minor&limit=500"
-EXCLUDED_PRODUCTS = {"small craft advisory", "gale warning", "heavy freezing spray warning"}
+EXCLUDED_PRODUCTS = {
+    "gale warning",
+    "heavy freezing spray warning",
+    "rip current statement",
+    "freeze warning",
+    "beach hazards statement",
+    "hazardous seas warning",
+    "special weather statement",
+}
+EXCLUDED_PRODUCT_SUBSTRINGS = ("advisory", "watch")
+EXCLUDED_PRODUCT_PREFIXES = ("winter weather", "winter storm", "heat")
 USER_AGENT = "CatenaryTransit/weather-alerts-mirror (https://github.com/catenarytransit/weather-alerts-mirror)"
 
 
@@ -274,7 +284,10 @@ def on_screen_alerts(collection, minor_ids):
         properties = feature["properties"]
         product = str(properties.get("prod_type") or "").strip().casefold()
         severity = str(properties.get("severity") or "").strip().casefold()
-        if (product in EXCLUDED_PRODUCTS or severity == "minor"
+        if (product in EXCLUDED_PRODUCTS
+                or any(term in product for term in EXCLUDED_PRODUCT_SUBSTRINGS)
+                or product.startswith(EXCLUDED_PRODUCT_PREFIXES)
+                or severity == "minor"
                 or cap_id(properties.get("cap_id")) in minor_ids):
             continue
         features.append(feature)
