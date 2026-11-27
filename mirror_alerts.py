@@ -18,6 +18,7 @@ ARCHIVE_URL = "https://tgftp.nws.noaa.gov/SL.us008001/DF.sha/DC.cap/DS.WWA/curre
 MINOR_URL = "https://api.weather.gov/alerts?active=true&severity=Minor&limit=500"
 EXCLUDED_PRODUCTS = {
     "gale warning",
+    "high wind warning",
     "heavy freezing spray warning",
     "rip current statement",
     "freeze warning",

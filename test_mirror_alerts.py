@@ -196,6 +196,7 @@ class DisplayTests(unittest.TestCase):
             "Wind Advisory", "Flood Advisory (updated)", "Tornado Watch",
             "Watch for Flooding", "Rip Current Statement", "Freeze Warning",
             "Beach Hazards Statement", "Hazardous Seas Warning",
+            "High Wind Warning", "  HIGH WIND WARNING  ",
             "Winter Storm Warning", "Winter Storm Emergency",
             "Winter Weather Statement", "Winter Weather/Storm Warning",
             "Special Weather Statement", "Heat Warning", "Heat Emergency",
