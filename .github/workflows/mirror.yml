@@ -1,0 +1,37 @@
+name: Mirror NWS weather alerts
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nws-alerts-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test pagination
+        run: python3 -m unittest -v
+      - name: Fetch all active alerts
+        if: github.event_name != 'pull_request'
+        run: python3 mirror_alerts.py alerts.geojson
+      - name: Publish latest GeoJSON
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view latest >/dev/null 2>&1; then
+            gh release create latest alerts.geojson --target "$GITHUB_SHA" --title "Latest weather alerts" --notes "Active NOAA/NWS weather alerts, refreshed every five minutes." --latest
+          else
+            gh release upload latest alerts.geojson --clobber
+          fi
