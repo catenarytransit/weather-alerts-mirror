@@ -1,4 +1,4 @@
-"""Mirror both NOAA WWA polygon layers into a single GeoJSON file."""
+"""Mirror NOAA WWA polygon layers and produce a filtered display GeoJSON."""
 
 import json
 import os
@@ -6,11 +6,13 @@ import sys
 import subprocess
 import time
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, unquote, urljoin, urlsplit
 
 BASE_URL = "https://mapservices.weather.noaa.gov/eventdriven/rest/services/WWA/watch_warn_adv/MapServer"
 LAYERS = {0: "CurrentWarnings", 1: "WatchesWarnings"}
 BATCH_SIZE = 100
+MINOR_URL = "https://api.weather.gov/alerts?active=true&severity=Minor&limit=500"
+EXCLUDED_PRODUCTS = {"small craft advisory", "gale warning", "heavy freezing spray warning"}
 USER_AGENT = "CatenaryTransit/weather-alerts-mirror (https://github.com/catenarytransit/weather-alerts-mirror)"
 
 
@@ -28,7 +30,7 @@ def fetch_page(url):
             result = subprocess.run(
                 ["curl", "--fail", "--silent", "--show-error", "--compressed",
                  "--connect-timeout", "8", "--max-time", "30",
-                 "--user-agent", USER_AGENT, url],
+                 "--user-agent", USER_AGENT, "--header", "Accept: application/geo+json, application/json", url],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=35,
             )
         except subprocess.TimeoutExpired as error:
@@ -138,9 +140,62 @@ def collect_alerts(fetch=fetch_page, batch_size=BATCH_SIZE):
     return {"type": "FeatureCollection", "features": features}
 
 
-def main():
-    output = Path(sys.argv[1] if len(sys.argv) > 1 else "alerts.geojson")
-    collection = collect_alerts()
+def cap_id(value):
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if value.startswith("https://api.weather.gov/alerts/"):
+        value = value.removeprefix("https://api.weather.gov/alerts/")
+    return unquote(value)
+
+
+def minor_alert_ids(fetch=fetch_page, pause=time.sleep):
+    # MapServer has no severity attribute. Query the CAP index for minor alerts
+    # only, and use their IDs, never their geometries.
+    url = MINOR_URL
+    seen = set()
+    ids = set()
+    while url:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or parsed.netloc != "api.weather.gov" or url in seen:
+            raise ValueError(f"Invalid or repeated minor-alert pagination URL: {url}")
+        seen.add(url)
+        page = fetch(url)
+        if (page.get("type") != "FeatureCollection"
+                or not isinstance(page.get("features"), list)):
+            raise ValueError("Invalid NWS minor-alert response")
+        for feature in page["features"]:
+            properties = feature.get("properties") or {}
+            if str(properties.get("severity", "")).strip().casefold() != "minor":
+                raise ValueError("NWS minor-alert query returned a non-minor alert")
+            aliases = {cap_id(properties.get("id")), cap_id(feature.get("id")),
+                       cap_id(properties.get("@id"))} - {""}
+            if not aliases:
+                raise ValueError("Minor alert has no CAP ID")
+            ids.update(aliases)
+        pagination = page.get("pagination") or {}
+        next_url = pagination.get("next")
+        url = urljoin(url, next_url) if next_url else None
+        if url:
+            pause(30)
+    print(f"NWS minor-alert index: {len(ids)} CAP IDs/aliases", flush=True)
+    return ids
+
+
+def on_screen_alerts(collection, minor_ids):
+    features = []
+    for feature in collection["features"]:
+        properties = feature["properties"]
+        product = str(properties.get("prod_type") or "").strip().casefold()
+        severity = str(properties.get("severity") or "").strip().casefold()
+        if (product in EXCLUDED_PRODUCTS or severity == "minor"
+                or cap_id(properties.get("cap_id")) in minor_ids):
+            continue
+        features.append(feature)
+    return {"type": "FeatureCollection", "features": features}
+
+
+def write_geojson(output, collection):
     temporary = output.with_name(output.name + ".tmp")
     try:
         with temporary.open("w", encoding="utf-8") as handle:
@@ -150,6 +205,16 @@ def main():
     finally:
         temporary.unlink(missing_ok=True)
     print(f"Wrote {len(collection['features'])} alerts to {output}", flush=True)
+
+
+def main():
+    output = Path(sys.argv[1] if len(sys.argv) > 1 else "alerts.geojson")
+    display_output = output.with_name(output.stem + "-on-screen.geojson")
+    collection = collect_alerts()
+    display = on_screen_alerts(collection, minor_alert_ids() if collection["features"] else set())
+    print(f"Excluded {len(collection['features']) - len(display['features'])} on-screen alerts", flush=True)
+    write_geojson(output, collection)
+    write_geojson(display_output, display)
 
 
 if __name__ == "__main__":
