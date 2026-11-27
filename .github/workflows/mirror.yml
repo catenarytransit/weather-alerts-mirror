@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! gh release view latest >/dev/null 2>&1; then
-            gh release create latest alerts.geojson --target "$GITHUB_SHA" --title "Latest weather alerts" --notes "Active NOAA/NWS weather alerts, refreshed every five minutes." --latest
+            gh release create latest alerts.geojson alerts-on-screen.geojson --target "$GITHUB_SHA" --title "Latest weather alerts" --notes "Active NOAA/NWS weather alerts, refreshed every five minutes." --latest
           else
-            gh release upload latest alerts.geojson --clobber
+            gh release upload latest alerts.geojson alerts-on-screen.geojson --clobber
           fi
