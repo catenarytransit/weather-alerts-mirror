@@ -1,4 +1,4 @@
-"""Fetch every page of active NWS alerts into a single GeoJSON file."""
+"""Mirror both NOAA WWA polygon layers into a single GeoJSON file."""
 
 import json
 import os
@@ -6,12 +6,14 @@ import sys
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-START_URL = "https://api.weather.gov/alerts?active=true&limit=500"
+BASE_URL = "https://mapservices.weather.noaa.gov/eventdriven/rest/services/WWA/watch_warn_adv/MapServer"
+LAYERS = {1: "WatchesWarnings", 0: "CurrentWarnings"}
+BATCH_SIZE = 200
 HEADERS = {
-    "Accept": "application/geo+json",
+    "Accept": "application/json, application/geo+json",
     "User-Agent": "CatenaryTransit/weather-alerts-mirror (https://github.com/catenarytransit/weather-alerts-mirror)",
 }
 
@@ -20,13 +22,16 @@ def fetch_page(url):
     for attempt in range(5):
         try:
             with urlopen(Request(url, headers=HEADERS), timeout=45) as response:
-                return json.load(response)
+                result = json.load(response)
+                if not isinstance(result, dict) or "error" in result:
+                    raise ValueError(f"ArcGIS query failed: {result}")
+                return result
         except (HTTPError, URLError, TimeoutError) as error:
             if isinstance(error, HTTPError) and error.code not in (408, 429, 500, 502, 503, 504):
                 raise
             if attempt == 4:
                 raise
-            delay = 30 * (2 ** attempt)
+            delay = 2 ** attempt
             if isinstance(error, HTTPError):
                 retry_after = error.headers.get("Retry-After", "")
                 if retry_after.isdigit():
@@ -35,49 +40,65 @@ def fetch_page(url):
             time.sleep(delay)
 
 
-def collect_alerts(fetch=fetch_page, pause=time.sleep):
-    url = START_URL
-    seen = set()
-    features = {}
-    pages = 0
+def query(layer, fetch, **params):
+    result = fetch(f"{BASE_URL}/{layer}/query?{urlencode(params)}")
+    if not isinstance(result, dict) or "error" in result:
+        raise ValueError(f"ArcGIS layer {layer} query failed: {result}")
+    return result
 
-    while url:
-        parsed = urlsplit(url)
-        if parsed.scheme != "https" or parsed.netloc != "api.weather.gov":
-            raise ValueError(f"Unexpected pagination URL: {url}")
-        if url in seen:
-            raise ValueError(f"Repeated pagination URL: {url}")
-        seen.add(url)
 
-        page = fetch(url)
-        if page.get("type") != "FeatureCollection" or not isinstance(page.get("features"), list):
-            raise ValueError("Expected a GeoJSON FeatureCollection")
-        for feature in page["features"]:
-            if (feature.get("type") != "Feature" or "geometry" not in feature
-                    or not isinstance(feature.get("properties"), dict)):
-                raise ValueError("Invalid GeoJSON alert feature")
-            alert_id = feature.get("id") or feature["properties"].get("id")
-            if not isinstance(alert_id, str) or not alert_id:
-                raise ValueError("Alert is missing its ID")
-            features.setdefault(alert_id, feature)
+def object_ids(layer, fetch):
+    result = query(layer, fetch, where="1=1", returnIdsOnly="true", f="json")
+    ids = result.get("objectIds")
+    if (not isinstance(ids, list) or any(type(oid) is not int for oid in ids)
+            or result.get("exceededTransferLimit")):
+        raise ValueError(f"Invalid object ID list for layer {layer}")
+    return sorted(set(ids))
 
-        pages += 1
-        print(f"Page {pages}: {len(page['features'])} alerts, {len(features)} unique", flush=True)
-        pagination = page.get("pagination")
-        if pagination is not None and not isinstance(pagination, dict):
-            raise ValueError("Invalid pagination metadata")
-        next_url = (pagination or {}).get("next")
-        if next_url is not None and not isinstance(next_url, str):
-            raise ValueError("Invalid next-page link")
-        url = urljoin(url, next_url) if next_url else None
-        if url:
-            # NWS recommends spacing alert requests by at least 30 seconds.
-            pause(30)
 
-    return {
-        "type": "FeatureCollection",
-        "features": [features[key] for key in sorted(features)],
-    }
+def fetch_batch(layer, ids, fetch):
+    result = query(layer, fetch, objectIds=",".join(map(str, ids)),
+                   outFields="*", returnGeometry="true", outSR=4326,
+                   returnZ="false", returnM="false", f="geojson")
+    if result.get("exceededTransferLimit"):
+        if len(ids) <= 1:
+            raise ValueError(f"Transfer limit exceeded for a single feature in layer {layer}")
+        middle = len(ids) // 2
+        return fetch_batch(layer, ids[:middle], fetch) + fetch_batch(layer, ids[middle:], fetch)
+    if result.get("type") != "FeatureCollection" or not isinstance(result.get("features"), list):
+        raise ValueError(f"Expected GeoJSON FeatureCollection for layer {layer}")
+
+    found = {}
+    for feature in result["features"]:
+        properties = feature.get("properties")
+        if (feature.get("type") != "Feature" or "geometry" not in feature
+                or not isinstance(properties, dict)):
+            raise ValueError(f"Invalid GeoJSON feature in layer {layer}")
+        oid = properties.get("objectid", feature.get("id"))
+        if type(oid) is not int or oid in found:
+            raise ValueError(f"Invalid or duplicate object ID in layer {layer}: {oid}")
+        # Object IDs are local to a layer; CAP IDs can span multiple geometries.
+        feature["id"] = f"{layer}:{oid}"
+        properties["noaa_layer"] = layer
+        properties["noaa_layer_name"] = LAYERS[layer]
+        found[oid] = feature
+    if set(found) != set(ids):
+        raise ValueError(f"Layer {layer} changed or returned incomplete results")
+    return [found[oid] for oid in ids]
+
+
+def collect_alerts(fetch=fetch_page, batch_size=BATCH_SIZE):
+    if batch_size < 1:
+        raise ValueError("Batch size must be positive")
+    features = []
+    for layer in LAYERS:
+        ids = object_ids(layer, fetch)
+        for start in range(0, len(ids), batch_size):
+            features.extend(fetch_batch(layer, ids[start:start + batch_size], fetch))
+        if object_ids(layer, fetch) != ids:
+            raise ValueError(f"Layer {layer} changed during download; retry on next run")
+        print(f"Layer {layer} ({LAYERS[layer]}): {len(ids)} features", flush=True)
+    return {"type": "FeatureCollection", "features": features}
 
 
 def main():
