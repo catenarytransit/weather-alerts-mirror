@@ -177,8 +177,8 @@ class DisplayTests(unittest.TestCase):
             {"prod_type": "Small Craft Advisory"},
             {"prod_type": "GALE WARNING"},
             {"prod_type": "Heavy Freezing Spray Warning"},
-            {"prod_type": "Flood Advisory", "severity": " Minor "},
-            {"prod_type": "Flood Advisory", "cap_id": "urn:oid:minor"},
+            {"prod_type": "Flood Warning", "severity": " Minor "},
+            {"prod_type": "Flood Warning", "cap_id": "urn:oid:minor"},
             {"prod_type": "Tornado Warning", "severity": "Severe"},
             {"prod_type": "Wind Advisory"},
             {"prod_type": "Gale Watch"},
@@ -187,9 +187,37 @@ class DisplayTests(unittest.TestCase):
             {"type": "Feature", "id": i, "geometry": None, "properties": p}
             for i, p in enumerate(properties)]}
         display = on_screen_alerts(collection, {"urn:oid:minor"})
-        self.assertEqual([f["id"] for f in display["features"]], [5, 6, 7])
+        self.assertEqual([f["id"] for f in display["features"]], [5])
         self.assertEqual(len(collection["features"]), 8)
         self.assertIs(display["features"][0], collection["features"][5])
+
+    def test_excluded_product_types(self):
+        excluded = (
+            "Wind Advisory", "Flood Advisory (updated)", "Tornado Watch",
+            "Watch for Flooding", "Rip Current Statement", "Freeze Warning",
+            "Beach Hazards Statement", "Hazardous Seas Warning",
+            "Winter Storm Warning", "Winter Storm Emergency",
+            "Winter Weather Statement", "Winter Weather/Storm Warning",
+            "Special Weather Statement", "Heat Warning", "Heat Emergency",
+            "  hEaT wArNiNg  ", "GALE WARNING", "Heavy Freezing Spray Warning",
+        )
+        for product in excluded:
+            with self.subTest(product=product):
+                collection = geojson_page([1])
+                collection["features"][0]["properties"]["prod_type"] = product
+                self.assertEqual(on_screen_alerts(collection, set()), geojson_page([]))
+                self.assertEqual(len(collection["features"]), 1)
+
+    def test_other_products_remain_visible(self):
+        products = (
+            "Tornado Warning", "Flash Flood Warning", "Severe Thunderstorm Warning",
+            "Hurricane Warning", "Blizzard Warning", "Ice Storm Warning",
+            "Hard Freeze Warning", "Storm Warning", None,
+        )
+        collection = geojson_page(range(len(products)))
+        for feature, product in zip(collection["features"], products):
+            feature["properties"]["prod_type"] = product
+        self.assertEqual(on_screen_alerts(collection, set()), collection)
 
     def test_minor_index_follows_cursor_and_normalizes_ids(self):
         second = "https://api.weather.gov/alerts?cursor=abc"
