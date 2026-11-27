@@ -53,6 +53,22 @@ class MapServerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             collect_alerts(lambda _: {"error": {"code": 500}})
 
+    def test_null_object_ids_with_zero_count(self):
+        def fetch(url):
+            params = parse_qs(urlsplit(url).query)
+            if params.get("returnCountOnly") == ["true"]:
+                return {"count": 0}
+            return {"objectIdFieldName": "objectid", "objectIds": None}
+        self.assertEqual(collect_alerts(fetch)["features"], [])
+
+    def test_null_object_ids_with_positive_count_fails(self):
+        def fetch(url):
+            if "returnCountOnly=true" in url:
+                return {"count": 5}
+            return {"objectIds": None}
+        with self.assertRaises(ValueError):
+            collect_alerts(fetch)
+
     def test_empty_layers(self):
         self.assertEqual(collect_alerts(lambda _: {"objectIds": []})["features"], [])
 
