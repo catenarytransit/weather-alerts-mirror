@@ -65,10 +65,19 @@ def query(layer, fetch, **params):
 
 def object_ids(layer, fetch):
     result = query(layer, fetch, where="1=1", returnIdsOnly="true", f="json")
-    ids = result.get("objectIds")
-    if (not isinstance(ids, list) or any(type(oid) is not int for oid in ids)
-            or result.get("exceededTransferLimit")):
-        raise ValueError(f"Invalid object ID list for layer {layer}")
+    if result.get("exceededTransferLimit") or "objectIds" not in result:
+        raise ValueError(f"Invalid object ID response for layer {layer}: {result!r}")
+    ids = result["objectIds"]
+    if ids is None:
+        # ArcGIS can return null rather than [] when the layer is empty.
+        # Confirm the count so an incomplete response is never published.
+        count = query(layer, fetch, where="1=1", returnCountOnly="true", f="json")
+        if type(count.get("count")) is not int or count["count"] != 0:
+            raise ValueError(f"Null object IDs for layer {layer}, but count response was {count!r}")
+        print(f"Layer {layer}: empty (null object IDs, count confirmed zero)", flush=True)
+        return []
+    if not isinstance(ids, list) or any(type(oid) is not int for oid in ids):
+        raise ValueError(f"Invalid object ID list for layer {layer}: {result!r}")
     return sorted(set(ids))
 
 
