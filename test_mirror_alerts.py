@@ -1,6 +1,6 @@
 import unittest
 from urllib.parse import urlsplit, parse_qs
-from mirror_alerts import collect_alerts, LAYERS
+from mirror_alerts import collect_alerts, LAYERS, DownloadTimeout
 
 
 def mock_server(url):
@@ -29,6 +29,14 @@ class MapServerTests(unittest.TestCase):
             params = parse_qs(urlsplit(url).query)
             if "," in params.get("objectIds", [""])[0]:
                 return {"exceededTransferLimit": True}
+            return mock_server(url)
+        self.assertEqual(len(collect_alerts(fetch)["features"]), 4)
+
+    def test_timeout_splits_batch(self):
+        def fetch(url):
+            params = parse_qs(urlsplit(url).query)
+            if "," in params.get("objectIds", [""])[0]:
+                raise DownloadTimeout("mock timeout")
             return mock_server(url)
         self.assertEqual(len(collect_alerts(fetch)["features"]), 4)
 
