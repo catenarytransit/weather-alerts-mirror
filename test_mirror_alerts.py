@@ -1,6 +1,7 @@
 import unittest
 from urllib.parse import urlsplit, parse_qs
-from mirror_alerts import collect_alerts, LAYERS, DownloadTimeout
+from mirror_alerts import (collect_alerts, LAYERS, DownloadTimeout,
+                           on_screen_alerts, minor_alert_ids, MINOR_URL)
 
 
 def mock_server(url):
@@ -71,6 +72,47 @@ class MapServerTests(unittest.TestCase):
 
     def test_empty_layers(self):
         self.assertEqual(collect_alerts(lambda _: {"objectIds": []})["features"], [])
+
+
+class DisplayTests(unittest.TestCase):
+    def test_filter_preserves_full_snapshot(self):
+        properties = [
+            {"prod_type": "Small Craft Advisory"},
+            {"prod_type": "GALE WARNING"},
+            {"prod_type": "Heavy Freezing Spray Warning"},
+            {"prod_type": "Flood Advisory", "severity": " Minor "},
+            {"prod_type": "Flood Advisory", "cap_id": "urn:oid:minor"},
+            {"prod_type": "Tornado Warning", "severity": "Severe"},
+            {"prod_type": "Wind Advisory"},
+            {"prod_type": "Gale Watch"},
+        ]
+        collection = {"type": "FeatureCollection", "features": [
+            {"type": "Feature", "id": i, "geometry": None, "properties": p}
+            for i, p in enumerate(properties)]}
+        display = on_screen_alerts(collection, {"urn:oid:minor"})
+        self.assertEqual([f["id"] for f in display["features"]], [5, 6, 7])
+        self.assertEqual(len(collection["features"]), 8)
+        self.assertIs(display["features"][0], collection["features"][5])
+
+    def test_minor_index_follows_cursor_and_normalizes_ids(self):
+        second = "https://api.weather.gov/alerts?cursor=abc"
+        pages = {
+            MINOR_URL: {"type": "FeatureCollection", "features": [
+                {"id": "https://api.weather.gov/alerts/urn%3Aoid%3Afirst",
+                 "properties": {"severity": "Minor", "id": "urn:oid:first"}}
+            ], "pagination": {"next": second}},
+            second: {"type": "FeatureCollection", "features": [
+                {"properties": {"severity": "Minor", "id": "urn:oid:second"}}
+            ]}
+        }
+        self.assertEqual(minor_alert_ids(pages.__getitem__, lambda _: None),
+                         {"urn:oid:first", "urn:oid:second"})
+
+    def test_invalid_minor_index_fails(self):
+        with self.assertRaises(ValueError):
+            minor_alert_ids(lambda _: {"type": "FeatureCollection", "features": [
+                {"properties": {"severity": "Severe", "id": "urn:oid:wrong"}}
+            ]}, lambda _: None)
 
 
 if __name__ == "__main__":
