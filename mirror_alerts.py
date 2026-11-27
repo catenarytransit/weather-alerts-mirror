@@ -4,6 +4,9 @@ import json
 import os
 import sys
 import subprocess
+import shutil
+import tarfile
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlencode, unquote, urljoin, urlsplit
@@ -11,6 +14,7 @@ from urllib.parse import urlencode, unquote, urljoin, urlsplit
 BASE_URL = "https://mapservices.weather.noaa.gov/eventdriven/rest/services/WWA/watch_warn_adv/MapServer"
 LAYERS = {0: "CurrentWarnings", 1: "WatchesWarnings"}
 BATCH_SIZE = 100
+ARCHIVE_URL = "https://tgftp.nws.noaa.gov/SL.us008001/DF.sha/DC.cap/DS.WWA/current_all.tar.gz"
 MINOR_URL = "https://api.weather.gov/alerts?active=true&severity=Minor&limit=500"
 EXCLUDED_PRODUCTS = {"small craft advisory", "gale warning", "heavy freezing spray warning"}
 USER_AGENT = "CatenaryTransit/weather-alerts-mirror (https://github.com/catenarytransit/weather-alerts-mirror)"
@@ -140,6 +144,81 @@ def collect_alerts(fetch=fetch_page, batch_size=BATCH_SIZE):
     return {"type": "FeatureCollection", "features": features}
 
 
+def archive_features(collection, name):
+    if collection.get("type") != "FeatureCollection" or not isinstance(collection.get("features"), list):
+        raise ValueError(f"Invalid GeoJSON from NOAA archive: {name}")
+    features = []
+    for index, feature in enumerate(collection["features"]):
+        properties = feature.get("properties")
+        geometry = feature.get("geometry")
+        if (feature.get("type") != "Feature" or not isinstance(properties, dict)
+                or not isinstance(geometry, dict)
+                or geometry.get("type") not in ("Polygon", "MultiPolygon")):
+            raise ValueError(f"Invalid polygon in NOAA archive: {name}")
+        fields = {key.casefold(): value for key, value in properties.items()}
+        if not fields.get("prod_type") or not fields.get("cap_id"):
+            raise ValueError(f"NOAA archive is missing prod_type/cap_id: {list(properties)}")
+        properties["prod_type"] = fields["prod_type"]
+        properties["cap_id"] = fields["cap_id"]
+        properties["noaa_source"] = "current_all.tar.gz"
+        properties["noaa_layer_name"] = name
+        feature["id"] = f"archive:{name}:{index}"
+        features.append(feature)
+    return features
+
+
+def fetch_archive():
+    if not shutil.which("ogr2ogr"):
+        raise RuntimeError("NOAA archive fallback requires ogr2ogr (sudo apt install gdal-bin)")
+    print(f"MapServer returned no records; downloading {ARCHIVE_URL}", flush=True)
+    with tempfile.TemporaryDirectory(prefix="noaa-wwa-") as directory:
+        root = Path(directory)
+        archive = root / "current_all.tar.gz"
+        subprocess.run(
+            ["curl", "--fail", "--show-error", "--location", "--connect-timeout", "10",
+             "--max-time", "120", "--retry", "1", "--output", str(archive), ARCHIVE_URL],
+            check=True, timeout=260,
+        )
+        # Extract only regular shapefile components into a private directory.
+        # Never extract arbitrary paths, links, or executable archive members.
+        with tarfile.open(archive, "r:gz") as source:
+            members = [m for m in source.getmembers() if m.isfile()
+                       and Path(m.name).suffix.lower() in {".shp", ".shx", ".dbf", ".prj", ".cpg"}]
+            for member in members:
+                target = root / Path(member.name).name
+                if target.exists():
+                    raise ValueError(f"Duplicate archive filename: {target.name}")
+                with source.extractfile(member) as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+        shapes = sorted(p for p in root.iterdir() if p.suffix.lower() == ".shp")
+        combined = [p for p in shapes if p.stem.casefold() == "current_all"]
+        if combined:
+            shapes = combined
+        if not shapes:
+            raise ValueError("No shapefiles found in NOAA archive")
+        features = []
+        for shape in shapes:
+            converted = root / (shape.stem + ".geojson")
+            print(f"Converting {shape.name} to GeoJSON", flush=True)
+            subprocess.run(
+                ["ogr2ogr", "-f", "GeoJSON", "-t_srs", "EPSG:4326",
+                 "-lco", "RFC7946=YES", str(converted), str(shape)],
+                check=True, timeout=120,
+            )
+            with converted.open(encoding="utf-8") as handle:
+                features.extend(archive_features(json.load(handle), shape.stem))
+        return {"type": "FeatureCollection", "features": features}
+
+
+def collect_with_fallback(primary=collect_alerts, fallback=fetch_archive):
+    collection = primary()
+    if not collection["features"]:
+        collection = fallback()
+    if not collection["features"]:
+        raise ValueError("Both NOAA sources returned no alerts; refusing to overwrite the previous snapshot")
+    return collection
+
+
 def cap_id(value):
     if not isinstance(value, str):
         return ""
@@ -210,7 +289,7 @@ def write_geojson(output, collection):
 def main():
     output = Path(sys.argv[1] if len(sys.argv) > 1 else "alerts.geojson")
     display_output = output.with_name(output.stem + "-on-screen.geojson")
-    collection = collect_alerts()
+    collection = collect_with_fallback()
     display = on_screen_alerts(collection, minor_alert_ids() if collection["features"] else set())
     print(f"Excluded {len(collection['features']) - len(display['features'])} on-screen alerts", flush=True)
     write_geojson(output, collection)
