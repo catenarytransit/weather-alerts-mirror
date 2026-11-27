@@ -1,7 +1,8 @@
 import unittest
 from urllib.parse import urlsplit, parse_qs
 from mirror_alerts import (collect_alerts, LAYERS, DownloadTimeout,
-                           on_screen_alerts, minor_alert_ids, MINOR_URL)
+                           on_screen_alerts, minor_alert_ids, MINOR_URL,
+                           collect_with_fallback, archive_features)
 
 
 def mock_server(url):
@@ -113,6 +114,31 @@ class DisplayTests(unittest.TestCase):
             minor_alert_ids(lambda _: {"type": "FeatureCollection", "features": [
                 {"properties": {"severity": "Severe", "id": "urn:oid:wrong"}}
             ]}, lambda _: None)
+
+
+class ArchiveTests(unittest.TestCase):
+    def test_empty_primary_uses_fallback(self):
+        empty = {"type": "FeatureCollection", "features": []}
+        full = {"type": "FeatureCollection", "features": [{"id": 1}]}
+        self.assertEqual(collect_with_fallback(lambda: empty, lambda: full), full)
+
+    def test_nonempty_primary_skips_fallback(self):
+        full = {"type": "FeatureCollection", "features": [{"id": 1}]}
+        def fail():
+            raise AssertionError("fallback should not run")
+        self.assertEqual(collect_with_fallback(lambda: full, fail), full)
+
+    def test_both_empty_fail(self):
+        empty = {"type": "FeatureCollection", "features": []}
+        with self.assertRaises(ValueError):
+            collect_with_fallback(lambda: empty, lambda: empty)
+
+    def test_archive_fields_normalized(self):
+        feature = {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": []},
+                   "properties": {"PROD_TYPE": "Gale Warning", "CAP_ID": "urn:oid:1"}}
+        result = archive_features({"type": "FeatureCollection", "features": [feature]}, "current_all")
+        self.assertEqual(result[0]["properties"]["prod_type"], "Gale Warning")
+        self.assertEqual(result[0]["properties"]["cap_id"], "urn:oid:1")
 
 
 if __name__ == "__main__":
